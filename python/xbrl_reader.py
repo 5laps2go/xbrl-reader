@@ -671,6 +671,16 @@ def get_schema_label_path(inf, ns_uri):
     elif ns_uri == "http://www.xbrl.org/2003/instance":
         xsd_path = root_dir + "/data/IFRS/xbrl-instance-2003-12-31.xsd"
         label_path = None
+    
+    elif ns_uri.startswith("http://www.xbrl.tdnet.info/jp/tse/tdnet/qc/edjp/"):
+        # "http://www.xbrl.tdnet.info/jp/tse/tdnet/qc/edjp/fr/18080/2020-12-31/01/2021-02-10"
+        #                               /0  /1    /2 /3   /4 /5    /6         /7 /8
+        v = ns_uri[len("http://www.xbrl.tdnet.info/jp/"):].split('/')
+        name = v[0] + '-' + ''.join(v[2:5]) + '-' + '-'.join(v[5:])
+
+        base_path = "%s/%s" % (inf.cur_dir, name)
+        xsd_path = base_path + '.xsd'
+        label_path = base_path + '-lab.xml'
 
     else:
         assert ns_uri in ["http://www.xbrl.org/2003/instance", "http://www.xbrl.org/2003/linkbase"]
@@ -1331,7 +1341,8 @@ def read_public_doc(inf, category_name, public_doc, reports):
     """
     global xbrl_idx, prev_time, prev_cnt, xbrl_basename, inline_xbrl_path, xbrl_path
 
-    xbrl_path_obj = find(public_doc.glob('jpcrp*.xbrl'))
+    # jpcr*.xbrl or tse-*.xbrl
+    xbrl_path_obj = find(public_doc.glob('[jt][ps][ce]*.xbrl'))
     assert xbrl_path_obj is not None
 
     xbrl_path = str(xbrl_path_obj)
@@ -1340,8 +1351,6 @@ def read_public_doc(inf, category_name, public_doc, reports):
 
     # if xbrl_basename != 'jpcrp040300-q2r-001_E03369-000_2016-09-30_01_2016-11-14.xbrl':
     #     continue
-
-    inf.end_date = xbrl_basename.split('_')[2]
 
     xbrl_idx += 1
     inf.progress[inf.cpu_id] = xbrl_idx
@@ -1373,8 +1382,7 @@ def read_public_doc(inf, category_name, public_doc, reports):
         ReadSchema(inf, True, local_xsd_path, ET.parse(local_xsd_path).getroot(), local_xsd_dic)
 
         # 名称リンクファイルのパス
-        local_label_path = local_xsd_path[:len(local_xsd_path) - 4] + "_lab.xml"
-        if os.path.exists(local_label_path):
+        for local_label_path in Path(inf.cur_dir).glob(local_xsd_path_obj.stem + "[-_]lab.xml"):
             # 名称リンクファイルがある場合
 
             resource_dic = {}
@@ -1384,8 +1392,7 @@ def read_public_doc(inf, category_name, public_doc, reports):
             label_cnt += 1
 
         # 計算ファイルのパス
-        local_cal_path = local_xsd_path[:-4] + '_cal.xml'
-        if os.path.exists(local_cal_path):
+        for local_cal_path in Path(inf.cur_dir).glob(local_xsd_path_obj.stem + "[-_]cal.xml"):
             locs = {}
             arcs = []
 
@@ -1394,8 +1401,8 @@ def read_public_doc(inf, category_name, public_doc, reports):
 
             # 計算リンクの計算関係を得る。
             readCalcArcs(local_xsd_dic, locs, arcs)
-
-    local_label_path_list = list(Path(inf.cur_dir).glob("*_lab.xml"))
+ 
+    local_label_path_list = list(Path(inf.cur_dir).glob("*[_-]lab.xml"))
     assert len(local_label_path_list) == label_cnt
 
     # 名前空間の接頭辞とURIの辞書を作る。
@@ -1430,6 +1437,39 @@ def read_public_doc(inf, category_name, public_doc, reports):
     reports.append( { 'end_date':inf.end_date, 'htm_paths':htm_paths } )
 
 
+def get_edicode_enddate(xbrl_path):
+    xbrl_path_basename = os.path.basename(str(xbrl_path))
+    if xbrl_path_basename.startswith("jpcrp"):
+        # パスの中のファイル名を得る。
+        # 'jpcrp040300-q2r-001_E03739-000_2017-09-30_01_2017-11-14.xbrl'
+        root_name, ext = os.path.splitext(xbrl_path_basename)
+
+        items = root_name.split('_')
+        end_date, filing_date = items[2], items[4]
+
+        # ファイル名を'-'と'_'で区切る。
+        items = re.split('[-_]', xbrl_path_basename)
+
+        # EDINETコードを得る。
+        edicode = items[3]
+    else:
+        el = ET.parse(xbrl_path).getroot()
+    
+        edicode_el = el.find('./jpdei_cor:EDINETCodeDEI', {'jpdei_cor': 'http://disclosure.edinet-fsa.go.jp/taxonomy/jpdei/2013-08-31/jpdei_cor'})
+        edicode = edicode_el.text
+        assert len(edicode) > 0
+        
+        end_date_el = el.find('./jpdei_cor:CurrentPeriodEndDateDEI', {'jpdei_cor': 'http://disclosure.edinet-fsa.go.jp/taxonomy/jpdei/2013-08-31/jpdei_cor'})
+        end_date = end_date_el.text
+        assert len(end_date) == 10
+        
+        filing_date_el = el.find('./xbrli:context[@id="FilingDateInstant"]/xbrli:period/xbrli:instant', {'xbrli': 'http://www.xbrl.org/2003/instance'})
+        filing_date = filing_date_el.text
+        assert len(filing_date) == 10
+
+    return edicode, end_date, filing_date
+
+
 def make_public_docs_list(cpu_count, company_dic):
     print('make public docs list...')
 
@@ -1439,32 +1479,18 @@ def make_public_docs_list(cpu_count, company_dic):
     # EDINETコード別のXBRLフォルダーの辞書を各CPUごとに作る。
     public_docs_list = [{} for i in range(cpu_count)]
 
-    # カテゴリー内の'XBRL/PublicDoc'のフォルダーに対し
-    for public_doc in Path(report_path).glob("**/XBRL/PublicDoc"):
+    # カテゴリー内の'XBRL/PublicDoc'のフォルダーに対し(TDNETの場合'XBRLData/Attachment'のフォルダー)
+    for public_doc in Path(report_path).glob("**/XBRL*/[PA][ut][bt]*"):
 
-        # jpcrpのxbrlファイルを得る。( ifrsのxbrlファイルは使わない。 )
-        xbrl_path_list = list(public_doc.glob('jpcrp*.xbrl'))
+        # jpcrp(又はtse)のxbrlファイルを得る。( ifrsのxbrlファイルは使わない。 )
+        xbrl_path_list = list(public_doc.glob('[jt][ps][ce]*.xbrl'))
         # assert len(xbrl_path_list) == 1
         if len(xbrl_path_list) != 1:
             print('jpcrp*.xbrl', str(public_doc))
             continue
 
         xbrl_path_0 = xbrl_path_list[0]
-
-        # パスの中のファイル名を得る。
-        # 'jpcrp040300-q2r-001_E03739-000_2017-09-30_01_2017-11-14.xbrl'
-        xbrl_path_0_basename = os.path.basename(str(xbrl_path_0))
-
-        root_name, ext = os.path.splitext(xbrl_path_0_basename)
-
-        items = root_name.split('_')
-        end_date, filing_date = items[2], items[4]
-
-        # ファイル名を'-'と'_'で区切る。
-        items = re.split('[-_]', xbrl_path_0_basename)
-
-        # EDINETコードを得る。
-        edinet_code = items[3]
+        edinet_code, end_date, filing_date = get_edicode_enddate(xbrl_path_0)
 
         # EDINETコードの各文字のUNICODEの合計値
         char_sum = sum(ord(x) for x in edinet_code)
@@ -1552,8 +1578,6 @@ def readXbrlThread(cpu_count, cpu_id, edinet_code_dic, progress, company_dic):
     # EDINETコードとXBRLフォルダーのリストに対し
     for edinet_code, end_date_dic in edinet_code_dic.items():
 
-        public_docs = [ x[1] for x in end_date_dic.values() ]
-
         category_name = company_dic[edinet_code]['category_name']
 
         # JSONを入れるフォルダー
@@ -1569,7 +1593,9 @@ def readXbrlThread(cpu_count, cpu_id, edinet_code_dic, progress, company_dic):
         inf.period_end_dates = {}
 
         # 各XBRLフォルダーに対し
-        for public_doc in public_docs:
+        for end_date, (filing_date, public_doc) in end_date_dic.items():
+
+            inf.end_date = end_date
             
             # XBRLフォルダー内のファイルを読む。
             read_public_doc(inf, category_name, public_doc, reports)
